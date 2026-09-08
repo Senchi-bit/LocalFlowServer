@@ -1,0 +1,5 @@
+LocalFlowServer/bin
+LocalFlowServer/obj
+
+*.user
+.idea
