@@ -4,202 +4,182 @@ using System.Text;
 namespace LocalFlowServer.Protocol;
 
 /// <summary>
-/// Двоичный формат LocalFlow UDP v1 (младший байт первым).
+/// Двоичный формат LocalFlow TCP v2 (младший байт первым).
 ///
-/// Заголовок (22 байта): магическое "LFLW" | version=1 | type | transferId (16-байтовый .NET Guid).
+/// Кадр: магическое "LFLW" | version=2 | type | transferId (16-байтовый .NET Guid) | payloadLen uint32 | payload.
 ///
-/// Hello:    uint16 nameLen | utf8-имя | int64 fileSize | uint32 chunkSize | uint32 totalChunks | SHA-256 (32 байта)
-/// HelloAck: uint8 status | uint32 chunkSize | uint32 windowSize | uint16 reasonLen | utf8-причина
-/// Data:     uint32 seq | uint16 len | полезная нагрузка
-/// Sack:     uint32 firstMissing | uint16 bitmapLen | битовая маска
-///           Бит i (младший бит байта 0 — i=0) означает, что пакет (firstMissing + 1 + i) получен.
-///           firstMissing == totalChunks — все куски на месте.
-/// Fin:      uint32 totalChunks | SHA-256 (32 байта)
-/// FinAck:   uint8 status | uint32 firstMissing | uint16 bitmapLen | битовая маска
+/// Hello:    uint16 nameLen | utf8-имя | int64 fileSize
+/// HelloAck: uint8 status | uint16 reasonLen | utf8-причина
+/// Fin:      SHA-256 (32 байта)
+/// FinAck:   uint8 status | uint16 reasonLen | utf8-причина
 /// Abort:    uint16 reasonLen | utf8-причина
 ///
-/// SHA-256 из одних нулей означает «хеш не передан». Датаграмма должна быть меньше 1472 байт.
+/// Тело файла идёт сырыми байтами между HelloAck и Fin, ровно fileSize байт.
 /// </summary>
 internal static class PacketCodec
 {
     private static ReadOnlySpan<byte> Magic => "LFLW"u8;
-    private const byte Version = 1;
-    private const int Sha256Size = 32;
+    private const byte Version = 2;
+    public const int HeaderSize = 26;
+    public const int Sha256Size = 32;
 
-    public static bool TryDecode(ReadOnlySpan<byte> buffer, out ProtocolPacket? packet)
+    public static async Task WriteAsync(Stream stream, ProtocolPacket packet, CancellationToken cancellationToken)
     {
-        packet = null;
-        if (buffer.Length < ServerSettings.HeaderSize)
-            return false;
+        var payload = EncodePayload(packet);
+        if (payload.Length > ServerSettings.MaxControlPayload)
+            throw new InvalidDataException("Слишком большой управляющий кадр.");
 
-        if (!buffer[..4].SequenceEqual(Magic))
-            return false;
-
-        if (buffer[4] != Version)
-            return false;
-
-        var type = (PacketType)buffer[5];
-        var transferId = new Guid(buffer.Slice(6, 16));
-        var payload = buffer[ServerSettings.HeaderSize..];
-
-        try
-        {
-            packet = type switch
-            {
-                PacketType.Hello => DecodeHello(transferId, payload),
-                PacketType.HelloAck => DecodeHelloAck(transferId, payload),
-                PacketType.Data => DecodeData(transferId, payload),
-                PacketType.Sack => DecodeSack(transferId, payload),
-                PacketType.Fin => DecodeFin(transferId, payload),
-                PacketType.FinAck => DecodeFinAck(transferId, payload),
-                PacketType.Abort => DecodeAbort(transferId, payload),
-                _ => null
-            };
-        }
-        catch (InvalidDataException)
-        {
-            packet = null;
-            return false;
-        }
-
-        return packet is not null;
+        var frame = new byte[HeaderSize + payload.Length];
+        WriteHeader(frame, TypeOf(packet), packet.TransferId, (uint)payload.Length);
+        payload.CopyTo(frame.AsSpan(HeaderSize));
+        await stream.WriteAsync(frame, cancellationToken).ConfigureAwait(false);
+        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public static byte[] Encode(HelloAckPacket packet)
+    public static async Task<ProtocolPacket> ReadAsync(Stream stream, CancellationToken cancellationToken)
     {
-        var reasonBytes = Encoding.UTF8.GetBytes(packet.Reason);
-        var length = ServerSettings.HeaderSize + 1 + 4 + 4 + 2 + reasonBytes.Length;
-        var buffer = new byte[length];
-        var span = buffer.AsSpan();
-        WriteHeader(span, PacketType.HelloAck, packet.TransferId);
-        var w = ServerSettings.HeaderSize;
-        span[w++] = (byte)packet.Status;
-        BinaryPrimitives.WriteUInt32LittleEndian(span[w..], packet.ChunkSize);
-        w += 4;
-        BinaryPrimitives.WriteUInt32LittleEndian(span[w..], packet.WindowSize);
-        w += 4;
-        WriteUtf8(span, ref w, reasonBytes);
-        return buffer;
+        var header = new byte[HeaderSize];
+        await stream.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
+
+        if (!header.AsSpan(0, 4).SequenceEqual(Magic))
+            throw new InvalidDataException("Неверная магия кадра.");
+        if (header[4] != Version)
+            throw new InvalidDataException("Неподдерживаемая версия протокола.");
+
+        var type = (PacketType)header[5];
+        var transferId = new Guid(header.AsSpan(6, 16));
+        var payloadLen = BinaryPrimitives.ReadUInt32LittleEndian(header.AsSpan(22, 4));
+        if (payloadLen > ServerSettings.MaxControlPayload)
+            throw new InvalidDataException("Слишком большой управляющий кадр.");
+
+        var payload = payloadLen == 0 ? [] : new byte[payloadLen];
+        if (payloadLen > 0)
+            await stream.ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false);
+
+        return Decode(type, transferId, payload);
     }
 
-    public static byte[] Encode(SackPacket packet)
+    private static byte[] EncodePayload(ProtocolPacket packet) => packet switch
     {
-        var length = ServerSettings.HeaderSize + 4 + 2 + packet.Bitmap.Length;
-        var buffer = new byte[length];
-        var span = buffer.AsSpan();
-        WriteHeader(span, PacketType.Sack, packet.TransferId);
-        var w = ServerSettings.HeaderSize;
-        BinaryPrimitives.WriteUInt32LittleEndian(span[w..], packet.FirstMissing);
-        w += 4;
-        BinaryPrimitives.WriteUInt16LittleEndian(span[w..], (ushort)packet.Bitmap.Length);
-        w += 2;
-        packet.Bitmap.CopyTo(span[w..]);
-        return buffer;
-    }
+        HelloPacket hello => EncodeHello(hello),
+        HelloAckPacket ack => EncodeHelloAck(ack),
+        FinPacket fin => EncodeFin(fin),
+        FinAckPacket ack => EncodeFinAck(ack),
+        AbortPacket abort => EncodeAbort(abort),
+        _ => throw new InvalidDataException("Неизвестный тип кадра.")
+    };
 
-    public static byte[] Encode(FinAckPacket packet)
+    private static PacketType TypeOf(ProtocolPacket packet) => packet switch
     {
-        var length = ServerSettings.HeaderSize + 1 + 4 + 2 + packet.Bitmap.Length;
-        var buffer = new byte[length];
-        var span = buffer.AsSpan();
-        WriteHeader(span, PacketType.FinAck, packet.TransferId);
-        var w = ServerSettings.HeaderSize;
-        span[w++] = (byte)packet.Status;
-        BinaryPrimitives.WriteUInt32LittleEndian(span[w..], packet.FirstMissing);
-        w += 4;
-        BinaryPrimitives.WriteUInt16LittleEndian(span[w..], (ushort)packet.Bitmap.Length);
-        w += 2;
-        packet.Bitmap.CopyTo(span[w..]);
-        return buffer;
-    }
+        HelloPacket => PacketType.Hello,
+        HelloAckPacket => PacketType.HelloAck,
+        FinPacket => PacketType.Fin,
+        FinAckPacket => PacketType.FinAck,
+        AbortPacket => PacketType.Abort,
+        _ => throw new InvalidDataException("Неизвестный тип кадра.")
+    };
 
-    public static byte[] Encode(AbortPacket packet)
-    {
-        var reasonBytes = Encoding.UTF8.GetBytes(packet.Reason);
-        var length = ServerSettings.HeaderSize + 2 + reasonBytes.Length;
-        var buffer = new byte[length];
-        var span = buffer.AsSpan();
-        WriteHeader(span, PacketType.Abort, packet.TransferId);
-        var w = ServerSettings.HeaderSize;
-        WriteUtf8(span, ref w, reasonBytes);
-        return buffer;
-    }
-
-    private static void WriteHeader(Span<byte> dest, PacketType type, Guid transferId)
+    private static void WriteHeader(Span<byte> dest, PacketType type, Guid transferId, uint payloadLen)
     {
         Magic.CopyTo(dest);
         dest[4] = Version;
         dest[5] = (byte)type;
         transferId.TryWriteBytes(dest.Slice(6, 16));
+        BinaryPrimitives.WriteUInt32LittleEndian(dest[22..], payloadLen);
     }
 
-    private static void WriteUtf8(Span<byte> dest, ref int w, byte[] utf8)
+    private static byte[] EncodeHello(HelloPacket packet)
     {
-        BinaryPrimitives.WriteUInt16LittleEndian(dest[w..], (ushort)utf8.Length);
-        w += 2;
-        utf8.CopyTo(dest[w..]);
-        w += utf8.Length;
+        var nameBytes = Encoding.UTF8.GetBytes(packet.FileName);
+        if (nameBytes.Length > ServerSettings.MaxFileNameBytes)
+            throw new InvalidDataException("Имя файла слишком длинное.");
+
+        var payload = new byte[2 + nameBytes.Length + 8];
+        var w = 0;
+        WriteUtf8(payload, ref w, nameBytes);
+        BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(w), packet.FileSize);
+        return payload;
     }
+
+    private static byte[] EncodeHelloAck(HelloAckPacket packet)
+    {
+        var reasonBytes = Encoding.UTF8.GetBytes(packet.Reason);
+        var payload = new byte[1 + 2 + reasonBytes.Length];
+        payload[0] = (byte)packet.Status;
+        var w = 1;
+        WriteUtf8(payload, ref w, reasonBytes);
+        return payload;
+    }
+
+    private static byte[] EncodeFin(FinPacket packet)
+    {
+        if (packet.Sha256.Length != Sha256Size)
+            throw new InvalidDataException("Неверный размер SHA-256.");
+        return packet.Sha256.ToArray();
+    }
+
+    private static byte[] EncodeFinAck(FinAckPacket packet)
+    {
+        var reasonBytes = Encoding.UTF8.GetBytes(packet.Reason);
+        var payload = new byte[1 + 2 + reasonBytes.Length];
+        payload[0] = (byte)packet.Status;
+        var w = 1;
+        WriteUtf8(payload, ref w, reasonBytes);
+        return payload;
+    }
+
+    private static byte[] EncodeAbort(AbortPacket packet)
+    {
+        var reasonBytes = Encoding.UTF8.GetBytes(packet.Reason);
+        var payload = new byte[2 + reasonBytes.Length];
+        var w = 0;
+        WriteUtf8(payload, ref w, reasonBytes);
+        return payload;
+    }
+
+    private static ProtocolPacket Decode(PacketType type, Guid transferId, ReadOnlySpan<byte> payload) => type switch
+    {
+        PacketType.Hello => DecodeHello(transferId, payload),
+        PacketType.HelloAck => DecodeHelloAck(transferId, payload),
+        PacketType.Fin => DecodeFin(transferId, payload),
+        PacketType.FinAck => DecodeFinAck(transferId, payload),
+        PacketType.Abort => DecodeAbort(transferId, payload),
+        _ => throw new InvalidDataException("Неизвестный тип кадра.")
+    };
 
     private static HelloPacket DecodeHello(Guid transferId, ReadOnlySpan<byte> payload)
     {
         var r = 0;
         var name = ReadUtf8(payload, ref r, ServerSettings.MaxFileNameBytes);
-        Need(payload, r, 8 + 4 + 4 + Sha256Size);
+        Need(payload, r, 8);
         var fileSize = BinaryPrimitives.ReadInt64LittleEndian(payload[r..]);
-        r += 8;
-        var chunkSize = BinaryPrimitives.ReadUInt32LittleEndian(payload[r..]);
-        r += 4;
-        var totalChunks = BinaryPrimitives.ReadUInt32LittleEndian(payload[r..]);
-        r += 4;
-        var sha = payload.Slice(r, Sha256Size).ToArray();
-        return new HelloPacket(transferId, name, fileSize, chunkSize, totalChunks, sha);
+        return new HelloPacket(transferId, name, fileSize);
     }
 
     private static HelloAckPacket DecodeHelloAck(Guid transferId, ReadOnlySpan<byte> payload)
     {
         var r = 0;
-        Need(payload, r, 1 + 4 + 4);
+        Need(payload, r, 1);
         var status = (HelloAckStatus)payload[r++];
-        var chunkSize = BinaryPrimitives.ReadUInt32LittleEndian(payload[r..]);
-        r += 4;
-        var windowSize = BinaryPrimitives.ReadUInt32LittleEndian(payload[r..]);
-        r += 4;
         var reason = ReadUtf8(payload, ref r, 1024);
-        return new HelloAckPacket(transferId, status, chunkSize, windowSize, reason);
-    }
-
-    private static DataPacket DecodeData(Guid transferId, ReadOnlySpan<byte> payload)
-    {
-        Need(payload, 0, 6);
-        var seq = BinaryPrimitives.ReadUInt32LittleEndian(payload);
-        var len = BinaryPrimitives.ReadUInt16LittleEndian(payload[4..]);
-        Need(payload, 6, len);
-        if (payload.Length != 6 + len)
-            throw new InvalidDataException("Несовпадение длины пакета Data.");
-        return new DataPacket(transferId, seq, payload.Slice(6, len).ToArray());
-    }
-
-    private static SackPacket DecodeSack(Guid transferId, ReadOnlySpan<byte> payload)
-    {
-        var (firstMissing, bitmap) = ReadSackBody(payload, 0);
-        return new SackPacket(transferId, firstMissing, bitmap);
+        return new HelloAckPacket(transferId, status, reason);
     }
 
     private static FinPacket DecodeFin(Guid transferId, ReadOnlySpan<byte> payload)
     {
-        Need(payload, 0, 4 + Sha256Size);
-        var totalChunks = BinaryPrimitives.ReadUInt32LittleEndian(payload);
-        var sha = payload.Slice(4, Sha256Size).ToArray();
-        return new FinPacket(transferId, totalChunks, sha);
+        Need(payload, 0, Sha256Size);
+        if (payload.Length != Sha256Size)
+            throw new InvalidDataException("Неверный размер SHA-256.");
+        return new FinPacket(transferId, payload[..Sha256Size].ToArray());
     }
 
     private static FinAckPacket DecodeFinAck(Guid transferId, ReadOnlySpan<byte> payload)
     {
-        Need(payload, 0, 1);
-        var status = (FinAckStatus)payload[0];
-        var (firstMissing, bitmap) = ReadSackBody(payload, 1);
-        return new FinAckPacket(transferId, status, firstMissing, bitmap);
+        var r = 0;
+        Need(payload, r, 1);
+        var status = (FinAckStatus)payload[r++];
+        var reason = ReadUtf8(payload, ref r, 1024);
+        return new FinAckPacket(transferId, status, reason);
     }
 
     private static AbortPacket DecodeAbort(Guid transferId, ReadOnlySpan<byte> payload)
@@ -209,13 +189,12 @@ internal static class PacketCodec
         return new AbortPacket(transferId, reason);
     }
 
-    private static (uint FirstMissing, byte[] Bitmap) ReadSackBody(ReadOnlySpan<byte> payload, int offset)
+    private static void WriteUtf8(Span<byte> dest, ref int w, byte[] utf8)
     {
-        Need(payload, offset, 6);
-        var firstMissing = BinaryPrimitives.ReadUInt32LittleEndian(payload[offset..]);
-        var bitmapLen = BinaryPrimitives.ReadUInt16LittleEndian(payload[(offset + 4)..]);
-        Need(payload, offset + 6, bitmapLen);
-        return (firstMissing, payload.Slice(offset + 6, bitmapLen).ToArray());
+        BinaryPrimitives.WriteUInt16LittleEndian(dest[w..], (ushort)utf8.Length);
+        w += 2;
+        utf8.CopyTo(dest[w..]);
+        w += utf8.Length;
     }
 
     private static string ReadUtf8(ReadOnlySpan<byte> payload, ref int r, int maxBytes)
@@ -234,6 +213,6 @@ internal static class PacketCodec
     private static void Need(ReadOnlySpan<byte> payload, int offset, int count)
     {
         if (offset < 0 || count < 0 || offset + count > payload.Length)
-            throw new InvalidDataException("Обрезанный пакет.");
+            throw new InvalidDataException("Обрезанный кадр.");
     }
 }

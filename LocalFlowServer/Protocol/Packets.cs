@@ -1,15 +1,13 @@
 namespace LocalFlowServer.Protocol;
 
-/// <summary>Типы UDP-пакетов LocalFlow. Клиент → сервер: Hello, Data, Fin, Abort.</summary>
+/// <summary>Типы кадров LocalFlow TCP v2. Клиент → сервер: Hello, Fin, Abort.</summary>
 internal enum PacketType : byte
 {
     Hello = 1,
     HelloAck = 2,
-    Data = 3,
-    Sack = 4,
-    Fin = 5,
-    FinAck = 6,
-    Abort = 7
+    Fin = 3,
+    FinAck = 4,
+    Abort = 5
 }
 
 internal enum HelloAckStatus : byte
@@ -21,49 +19,18 @@ internal enum HelloAckStatus : byte
 internal enum FinAckStatus : byte
 {
     Ok = 0,
-    Incomplete = 1,
-    HashMismatch = 2,
-    Error = 3
+    HashMismatch = 1,
+    Error = 2
 }
 
 internal abstract record ProtocolPacket(Guid TransferId);
 
-internal sealed record HelloPacket(
-    Guid TransferId,
-    string FileName,
-    long FileSize,
-    uint ProposedChunkSize,
-    uint TotalChunks,
-    byte[] Sha256) : ProtocolPacket(TransferId);
+internal sealed record HelloPacket(Guid TransferId, string FileName, long FileSize) : ProtocolPacket(TransferId);
 
-internal sealed record HelloAckPacket(
-    Guid TransferId,
-    HelloAckStatus Status,
-    uint ChunkSize,
-    uint WindowSize,
-    string Reason) : ProtocolPacket(TransferId);
+internal sealed record HelloAckPacket(Guid TransferId, HelloAckStatus Status, string Reason) : ProtocolPacket(TransferId);
 
-internal sealed record DataPacket(
-    Guid TransferId,
-    uint Seq,
-    byte[] Payload) : ProtocolPacket(TransferId);
+internal sealed record FinPacket(Guid TransferId, byte[] Sha256) : ProtocolPacket(TransferId);
 
-internal sealed record SackPacket(
-    Guid TransferId,
-    uint FirstMissing,
-    byte[] Bitmap) : ProtocolPacket(TransferId);
+internal sealed record FinAckPacket(Guid TransferId, FinAckStatus Status, string Reason) : ProtocolPacket(TransferId);
 
-internal sealed record FinPacket(
-    Guid TransferId,
-    uint TotalChunks,
-    byte[] Sha256) : ProtocolPacket(TransferId);
-
-internal sealed record FinAckPacket(
-    Guid TransferId,
-    FinAckStatus Status,
-    uint FirstMissing,
-    byte[] Bitmap) : ProtocolPacket(TransferId);
-
-internal sealed record AbortPacket(
-    Guid TransferId,
-    string Reason) : ProtocolPacket(TransferId);
+internal sealed record AbortPacket(Guid TransferId, string Reason) : ProtocolPacket(TransferId);

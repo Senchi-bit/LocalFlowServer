@@ -23,16 +23,16 @@ internal static class Program
         inbox.EnsureCreated();
         inbox.DeleteLeftoverPartials();
 
-        await using var server = new UdpFileServer(inbox);
+        await using var server = new TcpFileServer(inbox);
         await using var mdns = new MdnsAdvertiser();
 
         Console.WriteLine("Сервер LocalFlow");
-        Console.WriteLine($"Слушаю UDP 0.0.0.0:{server.Port}");
+        Console.WriteLine($"Слушаю TCP 0.0.0.0:{server.Port}");
         Console.WriteLine($"Входящие: {inbox.Path}");
 
         Console.WriteLine(mdns.TryStart()
             ? $"mDNS: {mdns.FullInstanceName}"
-            : "mDNS: сервис не объявлен (приём по UDP всё равно работает)");
+            : "mDNS: сервис не объявлен (приём по TCP всё равно работает)");
 
         Console.WriteLine("Нажмите Ctrl+C для остановки.");
         Console.WriteLine();
