@@ -1,98 +1,190 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using LocalFlowServer.Protocol;
 
 namespace LocalFlowServer.Transfer;
 
-internal sealed class TransferManager(InboxStore inbox, Action<byte[], IPEndPoint> send) : IDisposable
+internal sealed class TransferManager(InboxStore inbox) : IDisposable
 {
     private readonly ConcurrentDictionary<Guid, TransferSession> _sessions = new();
+    private readonly SemaphoreSlim _sessionSlots = new(ServerSettings.MaxSessions, ServerSettings.MaxSessions);
 
-    public void Handle(ProtocolPacket packet, IPEndPoint remote)
+    public async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
-        switch (packet)
-        {
-            case HelloPacket hello:
-                HandleHello(hello, remote);
-                break;
-            case DataPacket data:
-                HandleData(data, remote);
-                break;
-            case FinPacket fin:
-                HandleFin(fin, remote);
-                break;
-            case AbortPacket abort:
-                HandleAbort(abort);
-                break;
-        }
-    }
+        var remote = (IPEndPoint?)client.Client.RemoteEndPoint
+            ?? new IPEndPoint(IPAddress.None, 0);
 
-    public async Task RunIdleWatcherAsync(CancellationToken cancellationToken)
-    {
-        using var timer = new PeriodicTimer(ServerSettings.IdleSweepInterval);
+        client.NoDelay = true;
+        client.ReceiveBufferSize = ServerSettings.SocketBufferSize;
+        client.SendBufferSize = ServerSettings.SocketBufferSize;
+
+        var stream = client.GetStream();
+        TransferSession? session = null;
+        var slotTaken = false;
+        var helloAccepted = false;
+
+        using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        idleCts.CancelAfter(ServerSettings.IdleTimeout);
+
         try
         {
-            while (await timer.WaitForNextTickAsync(cancellationToken))
-                SweepIdle();
+            var first = await PacketCodec.ReadAsync(stream, idleCts.Token);
+            if (first is AbortPacket)
+                return;
+            if (first is not HelloPacket hello)
+                throw new InvalidDataException("Ожидался кадр Hello.");
+
+            if (!TryAcceptHello(hello, remote, out session, out var rejectReason, out slotTaken)
+                || session is null)
+            {
+                Log.Warn($"Hello отклонён от {remote.Address}: {rejectReason}");
+                await PacketCodec.WriteAsync(
+                    stream,
+                    new HelloAckPacket(hello.TransferId, HelloAckStatus.Rejected, rejectReason),
+                    cancellationToken);
+                return;
+            }
+
+            if (!_sessions.TryAdd(hello.TransferId, session))
+            {
+                session.Dispose();
+                session = null;
+                if (slotTaken)
+                {
+                    ReleaseSlot();
+                    slotTaken = false;
+                }
+
+                Log.Warn($"Hello отклонён от {remote.Address}: повторный идентификатор передачи");
+                await PacketCodec.WriteAsync(
+                    stream,
+                    new HelloAckPacket(hello.TransferId, HelloAckStatus.Rejected, "повторный идентификатор передачи"),
+                    cancellationToken);
+                return;
+            }
+
+            await PacketCodec.WriteAsync(
+                stream,
+                new HelloAckPacket(session.TransferId, HelloAckStatus.Ok, ""),
+                cancellationToken);
+            helloAccepted = true;
+            Log.Info($"[приём] {session.OriginalName} {Log.FormatSize(session.FileSize)} от {remote.Address} ... 0%");
+
+            await ReceiveBodyAsync(stream, session, idleCts, cancellationToken);
+
+            idleCts.CancelAfter(ServerSettings.IdleTimeout);
+            var afterBody = await PacketCodec.ReadAsync(stream, idleCts.Token);
+            switch (afterBody)
+            {
+                case AbortPacket abort:
+                    Log.Info($"[отмена] {session.OriginalName} клиентом: {abort.Reason}");
+                    return;
+                case FinPacket fin:
+                    await FinishAsync(stream, session, fin, cancellationToken);
+                    break;
+                default:
+                    throw new InvalidDataException("Ожидался кадр Fin.");
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            Log.Warn(session is null
+                ? $"[таймаут] простой {ServerSettings.IdleTimeout.TotalSeconds:0} с от {remote.Address}"
+                : $"[таймаут] {session.OriginalName} простой {ServerSettings.IdleTimeout.TotalSeconds:0} с");
+            if (helloAccepted && session is not null)
+                await TrySendAbortAsync(stream, session.TransferId, "таймаут простоя");
         }
         catch (OperationCanceledException)
         {
+            if (helloAccepted && session is not null)
+                await TrySendAbortAsync(stream, session.TransferId, "сервер останавливается");
+        }
+        catch (EndOfStreamException)
+        {
+            if (session is not null)
+                Log.Info($"[отмена] {session.OriginalName}: соединение разорвано");
+        }
+        catch (IOException ex)
+        {
+            Log.Warn($"Соединение с {remote.Address}: {ex.Message}");
+        }
+        catch (InvalidDataException ex)
+        {
+            Log.Warn($"Протокол от {remote.Address}: {ex.Message}");
+            if (helloAccepted && session is not null)
+                await TrySendAbortAsync(stream, session.TransferId, ex.Message);
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"Ошибка передачи от {remote.Address}: {ex.Message}");
+            if (helloAccepted && session is not null)
+                await TrySendAbortAsync(stream, session.TransferId, "ошибка сервера");
+        }
+        finally
+        {
+            if (session is not null)
+            {
+                _sessions.TryRemove(session.TransferId, out _);
+                session.Dispose();
+            }
+
+            if (slotTaken)
+                ReleaseSlot();
         }
     }
 
-    private void AbortAll(string reason)
+    public void Dispose()
     {
         foreach (var id in _sessions.Keys)
         {
             if (_sessions.TryRemove(id, out var session))
-                AbortSession(session, reason);
+                session.Dispose();
         }
+
+        _sessionSlots.Dispose();
     }
 
-    public void Dispose() => AbortAll("сервер останавливается");
-
-    private void HandleHello(HelloPacket hello, IPEndPoint remote)
+    private bool TryAcceptHello(
+        HelloPacket hello,
+        IPEndPoint remote,
+        out TransferSession? session,
+        out string rejectReason,
+        out bool slotTaken)
     {
-        if (_sessions.TryGetValue(hello.TransferId, out var existing))
-        {
-            existing.Touch();
-            SendHelloAck(existing, HelloAckStatus.Ok, "", remote);
-            return;
-        }
-
-        if (_sessions.Count >= ServerSettings.MaxSessions)
-        {
-            Reject(hello.TransferId, remote, "слишком много одновременных передач");
-            return;
-        }
+        session = null;
+        rejectReason = "";
+        slotTaken = false;
 
         switch (hello.FileSize)
         {
             case < 0:
-                Reject(hello.TransferId, remote, "Ошибочный размер файла");
-                return;
+                rejectReason = "Ошибочный размер файла";
+                return false;
             case > ServerSettings.MaxFileSizeBytes:
-                Reject(hello.TransferId, remote, "файл больше 10 ГиБ");
-                return;
+                rejectReason = "файл больше 10 ГиБ";
+                return false;
         }
 
         if (!inbox.TrySanitizeFileName(hello.FileName, out var safeName, out var nameError))
         {
-            Reject(hello.TransferId, remote, nameError);
-            return;
+            rejectReason = nameError;
+            return false;
         }
 
         if (!inbox.HasEnoughSpace(hello.FileSize))
         {
-            Reject(hello.TransferId, remote, "недостаточно места на диске");
-            return;
+            rejectReason = "недостаточно места на диске";
+            return false;
         }
 
-        var chunkSize = hello.ProposedChunkSize == 0
-            ? ServerSettings.MaxChunkPayload
-            : Math.Clamp(hello.ProposedChunkSize, ServerSettings.MinChunkPayload, ServerSettings.MaxChunkPayload);
+        if (!_sessionSlots.Wait(0))
+        {
+            rejectReason = "слишком много одновременных передач";
+            return false;
+        }
 
-        TransferSession session;
+        slotTaken = true;
         try
         {
             session = new TransferSession(
@@ -101,138 +193,90 @@ internal sealed class TransferManager(InboxStore inbox, Action<byte[], IPEndPoin
                 safeName,
                 safeName,
                 hello.FileSize,
-                chunkSize,
-                hello.Sha256,
                 inbox);
+            return true;
         }
         catch (Exception ex)
         {
-            Reject(hello.TransferId, remote, ex.Message);
-            return;
+            ReleaseSlot();
+            slotTaken = false;
+            rejectReason = ex.Message;
+            return false;
         }
-
-        if (!_sessions.TryAdd(hello.TransferId, session))
-        {
-            session.Dispose();
-            if (_sessions.TryGetValue(hello.TransferId, out existing))
-                SendHelloAck(existing, HelloAckStatus.Ok, "", remote);
-            return;
-        }
-
-        Log.Info($"[приём] {safeName} {Log.FormatSize(hello.FileSize)} от {remote.Address} ... начато");
-        SendHelloAck(session, HelloAckStatus.Ok, "", remote);
     }
 
-    private void HandleData(DataPacket data, IPEndPoint remote)
+    private static async Task ReceiveBodyAsync(
+        NetworkStream stream,
+        TransferSession session,
+        CancellationTokenSource idleCts,
+        CancellationToken cancellationToken)
     {
-        if (!_sessions.TryGetValue(data.TransferId, out var session))
-        {
-            send(PacketCodec.Encode(new AbortPacket(data.TransferId, "неизвестная передача")), remote);
+        var remaining = session.FileSize;
+        if (remaining == 0)
             return;
-        }
 
-        try
+        var buffer = new byte[ServerSettings.StreamBufferSize];
+        while (remaining > 0)
         {
-            session.AcceptData(data.Seq, data.Payload);
-        }
-        catch (IOException ex)
-        {
-            Log.Error($"Ошибка записи {session.OriginalName}: {ex.Message}");
-            if (_sessions.TryRemove(data.TransferId, out var failed))
-                AbortSession(failed, "ошибка записи");
-            return;
-        }
+            cancellationToken.ThrowIfCancellationRequested();
+            idleCts.CancelAfter(ServerSettings.IdleTimeout);
 
-        send(PacketCodec.Encode(session.CreateSack()), remote);
+            var toRead = (int)Math.Min(buffer.Length, remaining);
+            var read = await stream.ReadAsync(buffer.AsMemory(0, toRead), idleCts.Token);
+            if (read == 0)
+                throw new EndOfStreamException();
+
+            session.Write(buffer.AsSpan(0, read));
+            remaining -= read;
+        }
     }
 
-    private void HandleFin(FinPacket fin, IPEndPoint remote)
+    private static async Task FinishAsync(
+        NetworkStream stream,
+        TransferSession session,
+        FinPacket fin,
+        CancellationToken cancellationToken)
     {
-        if (!_sessions.TryGetValue(fin.TransferId, out var session))
-        {
-            send(PacketCodec.Encode(new AbortPacket(fin.TransferId, "неизвестная передача")), remote);
-            return;
-        }
-
-        var ack = session.Complete(fin, out var savedPath);
-        send(PacketCodec.Encode(ack), remote);
+        var ack = session.Complete(fin.Sha256, out var savedPath);
+        await PacketCodec.WriteAsync(stream, ack, cancellationToken);
 
         switch (ack.Status)
         {
             case FinAckStatus.Ok:
-                _sessions.TryRemove(fin.TransferId, out _);
-                session.Dispose();
                 Log.Info($"[готово] сохранён {Path.Combine(ServerSettings.InboxDirectoryName, Path.GetFileName(savedPath!))}");
                 break;
-            case FinAckStatus.Incomplete:
-                Log.Info($"[приём] {session.OriginalName} не завершена, нет куска {ack.FirstMissing}");
-                break;
             case FinAckStatus.HashMismatch:
-                if (_sessions.TryRemove(fin.TransferId, out var mismatch))
-                    mismatch.Dispose();
                 Log.Warn($"[сбой] {session.OriginalName}: не совпал SHA-256");
                 break;
             case FinAckStatus.Error:
-                if (_sessions.TryRemove(fin.TransferId, out var errored))
-                    errored.Dispose();
+                Log.Warn($"[сбой] {session.OriginalName}: {ack.Reason}");
                 break;
+            default:
+                throw new ArgumentOutOfRangeException();
         }
     }
 
-    private void HandleAbort(AbortPacket abort)
-    {
-        if (!_sessions.TryRemove(abort.TransferId, out var session))
-            return;
-
-        Log.Info($"[отмена] {session.OriginalName} клиентом: {abort.Reason}");
-        session.Dispose();
-    }
-
-    private void SweepIdle()
-    {
-        var now = DateTime.UtcNow;
-        foreach (var pair in _sessions)
-        {
-            if (now - pair.Value.LastActivityUtc < ServerSettings.IdleTimeout)
-                continue;
-
-            if (_sessions.TryRemove(pair.Key, out var session))
-            {
-                Log.Warn($"[таймаут] {session.OriginalName} простой {ServerSettings.IdleTimeout.TotalSeconds:0} с");
-                AbortSession(session, "таймаут простоя");
-            }
-        }
-    }
-
-    private void AbortSession(TransferSession session, string reason)
+    private static async Task TrySendAbortAsync(NetworkStream stream, Guid transferId, string reason)
     {
         try
         {
-            send(PacketCodec.Encode(new AbortPacket(session.TransferId, reason)), session.Remote);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await PacketCodec.WriteAsync(stream, new AbortPacket(transferId, reason), cts.Token);
         }
-        catch (Exception ex)
+        catch
         {
-            Log.Warn($"Не удалось отправить Abort: {ex.Message}");
+            // ignored
         }
-
-        session.Dispose();
     }
 
-    private void SendHelloAck(TransferSession session, HelloAckStatus status, string reason, IPEndPoint remote)
+    private void ReleaseSlot()
     {
-        var packet = new HelloAckPacket(
-            session.TransferId,
-            status,
-            session.ChunkSize,
-            ServerSettings.WindowSize,
-            reason);
-        send(PacketCodec.Encode(packet), remote);
-    }
-
-    private void Reject(Guid transferId, IPEndPoint remote, string reason)
-    {
-        Log.Warn($"Hello отклонён от {remote.Address}: {reason}");
-        var packet = new HelloAckPacket(transferId, HelloAckStatus.Rejected, 0, 0, reason);
-        send(PacketCodec.Encode(packet), remote);
+        try
+        {
+            _sessionSlots.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 }

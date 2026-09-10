@@ -1,6 +1,6 @@
 # LocalFlowServer
 
-A ready-to-use .NET file transfer system for local networks that requires no manual configuration. The system uses UDP.
+A ready-to-use .NET file transfer system for local networks that requires no manual configuration. The system uses TCP.
 
 ### Automatic server discovery
 * Uses the mDNS (Multicast DNS) protocol (Bonjour/Zeroconf) for zero-configuration setup
